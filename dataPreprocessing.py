@@ -83,7 +83,7 @@ def plot_distributions(notes: pd.DataFrame, drop_percentile=2.5):
 def notes_to_midi(
     notes: pd.DataFrame,
     out_file: str,
-    tmpo: float) -> stream.Stream:
+    tmpo: float = 120) -> stream.Stream:
 
     new_stream = stream.Stream()
     new_stream.insert(0,tempo.MetronomeMark(number=tmpo))
@@ -95,25 +95,10 @@ def notes_to_midi(
         duration = note_info['duration']
         pitch = note_info['pitch']
         
-        if i < 20:
-            print(start,duration,pitch)
-        
-        new_note.duration.quarterLength = duration
         new_note = note.Note(pitch)
+        new_note.duration.quarterLength = duration        
         new_note.offset = start
-        new_stream.append(new_note)
+        new_stream.insert(start,new_note)
     new_stream.write('midi',out_file)
     return new_stream
 
-sample_file = filenames[10]
-notes,tmpo = midi_to_notes(sample_file)
-print(sample_file)
-
-# plot_piano_roll(notes,40)
-# plt.show()
-
-new_stream = notes_to_midi(notes,'output.midi',tmpo)
-
-for n in new_stream.flat[:20]:
-    print(n)
-    print(n.offset)
