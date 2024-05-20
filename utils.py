@@ -1,10 +1,11 @@
 import glob
-from music21 import converter,instrument,note,chord,stream,meter,tempo
-from music21.midi import MidiFile
+from music21 import converter,note,chord,stream,tempo
 import pandas as pd
 import numpy as np
 import collections
 import seaborn as sns
+import tensorflow as tf
+import pickle
 
 from matplotlib import pyplot as plt
 from typing import Optional
@@ -78,7 +79,39 @@ def plot_distributions(notes: pd.DataFrame, drop_percentile=2.5):
   max_duration = np.percentile(notes['duration'], 100 - drop_percentile)
   sns.histplot(notes, x="duration", bins=np.linspace(0, max_duration, 21))
 
+key_order = ['pitch','step','duration']
 
+def create_sequences(
+    dataset: tf.data.Dataset,
+    seq_length: int,
+    vocab_size: int = 128
+) -> tf.data.Dataset:
+    
+    seq_length += 1
+
+    windows = dataset.window(seq_length,shift=1,stride=1,
+                             drop_remainder=True)
+    
+    sequences = windows.flat_map(lambda x: x.batch(seq_length,
+                                                  drop_remainder=True))
+    
+    def scale_pitch(x):
+        x = x/[vocab_size,1,1]
+        return x
+    
+    def split_labels(sequence):
+        inputs = sequence[:-1]
+        labels_dense = sequence[-1]
+        labels = {key:labels_dense[i] for i,key in enumerate(key_order)}
+
+        return scale_pitch(inputs),labels
+    
+    return sequences.map(split_labels, num_parallel_calls=tf.data.AUTOTUNE)
+
+def mse_pos_pressure(y_true: tf.Tensor, y_pred: tf.Tensor):
+    mse = (y_true-y_pred)**2
+    pos_pressure = 15*tf.minimum(tf.maximum(0.1-y_pred,0),2*abs(y_pred))
+    return tf.reduce_mean(mse + pos_pressure)
 
 def notes_to_midi(
     notes: pd.DataFrame,
@@ -87,8 +120,6 @@ def notes_to_midi(
 
     new_stream = stream.Stream()
     new_stream.insert(0,tempo.MetronomeMark(number=tmpo))
-
-
 
     for i,note_info in notes.iterrows():
         start = note_info['start']
@@ -101,4 +132,76 @@ def notes_to_midi(
         new_stream.insert(start,new_note)
     new_stream.write('midi',out_file)
     return new_stream
+
+def predict_next_note(
+    notes: np.ndarray, 
+    model: tf.keras.Model, 
+    temperature: float = 1.0) -> tuple[int, float, float]:
+  """Generates a note as a tuple of (pitch, step, duration), using a trained sequence model."""
+
+  assert temperature > 0
+
+  # Add batch dimension
+  inputs = tf.expand_dims(notes, 0)
+
+  predictions = model.predict(inputs, verbose=0)
+  pitch_logits = predictions['pitch']
+  step = predictions['step']
+  duration = predictions['duration']
+ 
+  pitch_logits /= temperature
+
+  pitch = tf.random.categorical(pitch_logits, num_samples=1)
+  pitch = tf.squeeze(pitch, axis=-1)
+  duration = tf.squeeze(duration, axis=-1)
+  step = tf.squeeze(step, axis=-1)
+
+  # `step` and `duration` values should be non-negative
+
+  step+= tf.random.normal(shape=(1,),mean=0.05,stddev=0.3)
+  step = tf.maximum(0, step)
+  duration = tf.maximum(0, duration)
+
+  return int(pitch), float(step), float(duration)
+
+
+seq_length = 50
+vocab_size = 128
+
+input_shape = (seq_length, 3)
+learning_rate = 0.001
+
+inputs = tf.keras.Input(input_shape)
+x = tf.keras.layers.LSTM(vocab_size)(inputs)
+
+outputs = {
+    'pitch': tf.keras.layers.Dense(vocab_size, name='pitch')(x),
+    'step': tf.keras.layers.Dense(1, name='step')(x),
+    'duration': tf.keras.layers.Dense(1, name='duration')(x)
+}
+
+loss = {
+    'pitch': tf.keras.losses.SparseCategoricalCrossentropy(
+        from_logits=True),
+    'step': mse_pos_pressure,
+    'duration': mse_pos_pressure,
+}
+
+
+model = tf.keras.Model(inputs, outputs)
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate,clipnorm=1.0)
+
+model.compile(
+    loss=loss,
+    loss_weights={
+        'pitch': 2.0,
+        'step': 0.2,
+        'duration':1.0,
+    },
+    optimizer=optimizer,
+)
+
+final_weights = 'final_weights.keras'
+
 
